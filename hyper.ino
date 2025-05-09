@@ -1,7 +1,7 @@
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
-#include <Adafruit_MPL3115A2.h>
+#include <MS5611.h>
 #include <Adafruit_BNO055.h>
 #include <arm_math.h>
 #include <TinyGPS++.h>
@@ -9,7 +9,7 @@
 // Sensor objects
 TinyGPSPlus gps;
 Adafruit_BME280 bme;
-Adafruit_MPL3115A2 mpl;
+MS5611 ms5611(0x77);
 Adafruit_BNO055 bno = Adafruit_BNO055(55);
 #define SEALEVELPRESSSURE_HPA (1013.25)
 
@@ -34,7 +34,7 @@ arm_matrix_instance_f32 x;                  // State vector [n x 1]
 arm_matrix_instance_f32 P;                  // Covariance [n x n]
 arm_matrix_instance_f32 Q;                  // Process noise [n x n]
 float R_bme = 1.5;                          // BME measurement noise
-float R_mpl = 1.5;                          // MPL measurement noise
+float R_ms = 1.5;                          // MS measurement noise
 
 // Sensor fusion
 #define VOTING_WINDOW 10
@@ -58,12 +58,26 @@ float wm[sigmaCount], wc[sigmaCount];     // Weights
 float estimatedMaxAltitude = 0;
 
 void setup() {
+  Wire.begin();
   Serial.begin(115200);
+
+  while (!Serial);
+    Serial.println("\nI2C Scanner");
+    
+    for (byte address = 1; address < 127; address++) {
+      Wire.beginTransmission(address);
+      if (Wire.endTransmission() == 0) {
+        Serial.print("Found I2C device at 0x");
+        Serial.println(address, HEX);
+      }
+      delay(5);
+    }
   
   // Initialize sensors
   bno.begin();
   bme.begin(0x77);
-  mpl.begin();
+  ms5611.begin();
+  ms5611.setOversampling(OSR_LOW);
 
   // Initialize ARM matrices
   arm_mat_init_f32(&x, n, 1, x_data);
@@ -96,8 +110,8 @@ void loop() {
   // Read sensor data
   readIMUData();
   float alt_bme = getAltBME();
-  float alt_mpl = getAltMPL();
-  float usedAlt = fuseAltitudes(alt_bme, alt_mpl);
+  float alt_ms = getAltMS();
+  float usedAlt = fuseAltitudes(alt_bme, alt_ms);
 
   // Unscented KF Prediction
   float Xsig[n][sigmaCount];            // Sigma points
@@ -121,7 +135,7 @@ void loop() {
   runStateMachine(x_data[0], x_data[1], acz, orx);
 
   // Log data
-  logSensorData(usedAlt, alt_bme, alt_mpl);
+  logSensorData(usedAlt, alt_bme, alt_ms);
 }
 
 void readIMUData() {
@@ -140,9 +154,9 @@ void readIMUData() {
 float getAltBME() {
   return bme.readAltitude(SEALEVELPRESSSURE_HPA);
 }
-
-float getAltMPL() {
-  return mpl.getAltitude();
+float getAltMS() {
+  float pressure = ms5611.getPressure(); // mbar cinsinden
+  return 44330.0 * (1.0 - pow(pressure / SEALEVELPRESSSURE_HPA, 0.1903));
 }
 
 float fuseAltitudes(float alt1, float alt2) {
@@ -241,7 +255,7 @@ void update_with_measurement(float z_meas) {
   // Measurement prediction
   float z_pred = x_data[0];
   float innov = z_meas - z_pred;
-  float R_combined = (R_bme + R_mpl) * 0.5f;
+  float R_combined = (R_bme + R_ms) * 0.5f;
 
   float relInnov = fabs(innov) / max(fabs(z_pred), 1.0f);
 
@@ -276,15 +290,13 @@ void update_with_measurement(float z_meas) {
   arm_mat_mult_f32(&P_temp_mat, &P_mat, &P_mat);
   
   // Add KRK' term
-  P_data[0] += K[0] * R_combined * K[0];
-  P_data[1] += K[0] * R_combined * K[1];
-  P_data[2] += K[1] * R_combined * K[0];
-  P_data[3] += K[1] * R_combined * K[1];
+  P_data[0] += K0 * R_combined * K0;
+  P_data[1] += K0 * R_combined * K1;
+  P_data[2] += K1 * R_combined * K0;
+  P_data[3] += K1 * R_combined * K1;
 }
 
 void runStateMachine(float altitude, float velocity, float accelZ, float orientationX) {
-  static unsigned long peakDetectedTime = 0;
-  static float peakAlt = 0;
   
   switch (state) {
     case 1:  // Sensor check
@@ -333,14 +345,14 @@ void runStateMachine(float altitude, float velocity, float accelZ, float orienta
 
 bool testSensors() {
   float alt_bme = getAltBME();
-  float alt_mpl = getAltMPL();
+  float alt_ms = getAltMS();
   imu::Vector<3> accel = bno.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
 
   bool bme_ok = !isnan(alt_bme) && alt_bme > -100 && alt_bme < 10000;
-  bool mpl_ok = !isnan(alt_mpl) && alt_mpl > -100 && alt_mpl < 10000;
+  bool ms_ok = !isnan(alt_ms) && alt_ms > -100 && alt_ms < 10000;
   bool bno_ok = !isnan(accel.x()) && !isnan(accel.y()) && !isnan(accel.z());
 
-  return bme_ok && mpl_ok && bno_ok;
+  return bme_ok && ms_ok && bno_ok;
 }
 
 bool isLaunchDetected() {
@@ -361,11 +373,11 @@ bool isLaunchDetected() {
 bool isAltitudeRising() {
   return (x.pData[1] > 10 && usedAlt > 900);
 }
-bool checkAltitudeCondition(double h, double altitude_bme, double altitude_mpl, double threshold) {
+bool checkAltitudeCondition(double h, double altitude_bme, double altitude_ms, double threshold) {
   int validCount = 0;
   if (h > threshold) validCount++;
   if (altitude_bme > threshold) validCount++;
-  if (altitude_mpl > threshold) validCount++;
+  if (altitude_ms > threshold) validCount++;
   return (validCount >= 2);
 }
 
@@ -454,11 +466,11 @@ bool peakDetect(float currentAltitude, float currentVelocity, float currentAccel
     return false;
 }
 
-void logSensorData(float usedAlt,float alt_bme,float alt_mpl){
+void logSensorData(float usedAlt,float alt_bme,float alt_ms){
     Serial.print("State: "); Serial.println(state);
     Serial.print("usedAlt: "); Serial.println(usedAlt);
     Serial.print("BME alt: "); Serial.println(alt_bme);
-    Serial.print("MPL alt: "); Serial.println(alt_mpl);
+    Serial.print("MS alt: "); Serial.println(alt_ms);
     Serial.print("Estimated Peak Alt: "); Serial.println(estimatedMaxAltitude);
 
     Serial.print("Accel X: "); Serial.print(acx);
