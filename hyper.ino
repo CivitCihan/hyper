@@ -9,11 +9,11 @@
 // Sensor objects
 TinyGPSPlus gps;
 Adafruit_BME280 bme;
-MS5611 ms5611(0x77);
 Adafruit_BNO055 bno = Adafruit_BNO055(55);
 #define SEALEVELPRESSSURE_HPA (1013.25)
 
 float h, alt1, alt2;
+double myRealAltitude = 0;
 float usedAlt;
 float prevPeakEstimate = 0;
 float peakSmoothingFactor = 0.9;
@@ -58,26 +58,26 @@ float wm[sigmaCount], wc[sigmaCount];     // Weights
 float estimatedMaxAltitude = 0;
 
 void setup() {
-  Wire.begin();
   Serial.begin(115200);
-
   while (!Serial);
-    Serial.println("\nI2C Scanner");
-    
-    for (byte address = 1; address < 127; address++) {
-      Wire.beginTransmission(address);
-      if (Wire.endTransmission() == 0) {
-        Serial.print("Found I2C device at 0x");
-        Serial.println(address, HEX);
-      }
-      delay(5);
+  Wire.begin();
+  Wire.setClock(100000);  // 100 kHz instead of 400 kHz
+
+  Serial.println("I2C Scanner");
+
+  for (byte address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("Found I2C device at 0x");
+      Serial.println(address, HEX);
     }
+    delay(5);
+  }
   
   // Initialize sensors
   bno.begin();
-  bme.begin(0x77);
-  ms5611.begin();
-  ms5611.setOversampling(OSR_LOW);
+  ms5611.begin(); 
+  bme.begin(0x76);
 
   // Initialize ARM matrices
   arm_mat_init_f32(&x, n, 1, x_data);
@@ -154,9 +154,12 @@ void readIMUData() {
 float getAltBME() {
   return bme.readAltitude(SEALEVELPRESSSURE_HPA);
 }
+
 float getAltMS() {
-  float pressure = ms5611.getPressure(); // mbar cinsinden
-  return 44330.0 * (1.0 - pow(pressure / SEALEVELPRESSSURE_HPA, 0.1903));
+  float pressure = ms5611.readPressure();
+  Serial.print("Raw MS5611 pressure: "); Serial.println(pressure);
+  float pressure_hPa = pressure / 50.0f;  // Remove if already in hPa
+  return 44330.0f * (1.0f - pow(pressure_hPa / SEALEVELPRESSSURE_HPA, 0.1903f));
 }
 
 float fuseAltitudes(float alt1, float alt2) {
