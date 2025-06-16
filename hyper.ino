@@ -9,6 +9,7 @@
 // Sensor objects
 TinyGPSPlus gps;
 Adafruit_BME280 bme;
+MS5611 ms5611;
 Adafruit_BNO055 bno = Adafruit_BNO055(55);
 #define SEALEVELPRESSSURE_HPA (1013.25)
 
@@ -21,6 +22,7 @@ unsigned long lastPeakUpdate = 0;
 bool peakDetected = false;
 unsigned long peakDetectedTime = 0;
 float peakAlt = 0;
+float sensor_std_dev;
 
 // Unscented KF Configuration
 const int n = 2;                            // State dimension (altitude, velocity)
@@ -42,6 +44,8 @@ float h_history[VOTING_WINDOW] = {0};
 int history_index = 0;
 
 // System state
+unsigned long lastStateChange = 0;
+const unsigned long stateHoldTime = 100;
 unsigned long lastUpdate = 0;
 float df = 0;                             // Time difference
 float acx = 0, acy = 0, acz = 0;          // Acceleration
@@ -111,7 +115,7 @@ void loop() {
   readIMUData();
   float alt_bme = getAltBME();
   float alt_ms = getAltMS();
-  float usedAlt = fuseAltitudes(alt_bme, alt_ms);
+  usedAlt = fuseAltitudes(alt_bme, alt_ms);
 
   // Unscented KF Prediction
   float Xsig[n][sigmaCount];            // Sigma points
@@ -132,10 +136,14 @@ void loop() {
   update_with_measurement(usedAlt);
 
   // State machine
-  runStateMachine(x_data[0], x_data[1], acz, orx);
+  runStateMachine(x_data[0], alt_bme, alt_ms, x_data[1], acz, orx);
 
   // Log data
   logSensorData(usedAlt, alt_bme, alt_ms);
+}
+
+float safeValue(float v, float fallback) {
+  return (isnan(v) || isinf(v)) ? fallback : v;
 }
 
 void readIMUData() {
@@ -152,19 +160,31 @@ void readIMUData() {
 }
 
 float getAltBME() {
-  return bme.readAltitude(SEALEVELPRESSSURE_HPA);
+  return safeValue(bme.readAltitude(SEALEVELPRESSSURE_HPA), x_data[0]);
 }
 
 float getAltMS() {
   float pressure = ms5611.readPressure();
-  Serial.print("Raw MS5611 pressure: "); Serial.println(pressure);
-  float pressure_hPa = pressure / 50.0f;  // Remove if already in hPa
-  return 44330.0f * (1.0f - pow(pressure_hPa / SEALEVELPRESSSURE_HPA, 0.1903f));
+  if (isnan(pressure) || pressure <= 0) return x_data[0];
+  float pressure_hPa = pressure / 50.0f;
+  float alt = 44330.0f * (1.0f - pow(pressure_hPa / SEALEVELPRESSSURE_HPA, 0.1903f));
+  return safeValue(alt, x_data[0]);
 }
-
+/*
 float fuseAltitudes(float alt1, float alt2) {
   // Simple fusion with outlier rejection
   if (abs(alt1 - alt2) > 10) {
+    return (abs(alt1 - x_data[0]) < abs(alt2 - x_data[0])) ? alt1 : alt2;
+  }
+  return (alt1 + alt2) / 2.0;
+}
+*/
+// Outlier
+float fuseAltitudes(float alt1, float alt2) {
+  float diff = abs(alt1 - alt2);
+  float threshold = sensor_std_dev * 3.0; // 3σ kuralı
+
+  if (diff > threshold) {
     return (abs(alt1 - x_data[0]) < abs(alt2 - x_data[0])) ? alt1 : alt2;
   }
   return (alt1 + alt2) / 2.0;
@@ -179,7 +199,8 @@ void generate_sigma_points(float Xsig[n][sigmaCount]) {
   // Compute Cholesky decomposition (P = L*L^T)
   for (int i = 0; i < n; i++) {
     for (int j = 0; j < n; j++) {
-      sqrtP[i][j] = (i == j) ? sqrt(P_data[i*n + j]) : 0;
+      float val = P_data[i*n + j];
+      sqrtP[i][j] = (i == j && val > 0) ? sqrt(val) : 0;
     }
   }
   
@@ -260,7 +281,11 @@ void update_with_measurement(float z_meas) {
   float innov = z_meas - z_pred;
   float R_combined = (R_bme + R_ms) * 0.5f;
 
-  float relInnov = fabs(innov) / max(fabs(z_pred), 1.0f);
+  float relInnov = 0;
+
+  if(!isnan(z_pred) && !isnan(innov)){
+    relInnov = fabs(innov) / max(fabs(z_pred), 1.0f);
+  }
 
   if (relInnov > 0.05f){
     R_combined *= 10.0f;
@@ -299,10 +324,14 @@ void update_with_measurement(float z_meas) {
   P_data[3] += K1 * R_combined * K1;
 }
 
-void runStateMachine(float altitude, float velocity, float accelZ, float orientationX) {
+void runStateMachine(float h, float alt1, float alt2, float velocity, float accelZ, float orientationX) {
   
+  unsigned long now = millis();
+
+
   switch (state) {
     case 1:  // Sensor check
+
       if (testSensors()) {
         state = 2;
         digitalWrite(8, HIGH);
@@ -317,21 +346,21 @@ void runStateMachine(float altitude, float velocity, float accelZ, float orienta
       break;
       
     case 3:  // Ascent
-      if (checkAltitudeCondition(h, alt1, alt2, 4000) && (-10 < orx && orx < 10)) state = 4;
+      if (checkAltitudeCondition(h, alt1, alt2, 4000)) state = 4;
       break;
       
     case 4:  // Apogee detection
-      if (peakDetect(altitude, velocity, accelZ, orientationX)) {
+      if (peakDetect(h, velocity, accelZ, orientationX)) {
         parachute1 = true;
         state = 5;
         digitalWrite(5, HIGH);
-        peakAlt = altitude;
+        peakAlt = h;
         peakDetectedTime = millis();
       }
       break;
       
     case 5:  // Descent
-      if (altitude < 600 && parachute1) {
+      if (h < 1000 && parachute1) {
         parachute2 = true;
         state = 6;
         digitalWrite(4, HIGH);
@@ -339,7 +368,7 @@ void runStateMachine(float altitude, float velocity, float accelZ, float orienta
       break;
       
     case 6:  // Landing
-      if (altitude < 50 && velocity < 5) {
+      if (h < 50 && velocity < 5) {
         Serial.println("Landing complete");
       }
       break;
@@ -358,29 +387,34 @@ bool testSensors() {
   return bme_ok && ms_ok && bno_ok;
 }
 
+bool isAltitudeRising() {
+  if(x.pData[1] > 5 && usedAlt > 900){
+    return true;
+  }
+  return false;
+}
+
 bool isLaunchDetected() {
   #define VOTING_WINDOW 10
   float h_history[VOTING_WINDOW] = {0};
   static int counter = 0;
-
   h_history[history_index] = x.pData[0];
   history_index = (history_index + 1) % VOTING_WINDOW;
-  if ((abs(acx) > 3.0 || x.pData[0] - h_history[(history_index + 1) % VOTING_WINDOW] > 2.0) && isAltitudeRising()) {
+  if ((abs(acx) > -1.0 || x.pData[0] - h_history[(history_index + 1) % VOTING_WINDOW] > 2.0) && isAltitudeRising()) {
     counter++;
   } else {
     counter = 0;
   }
-  return counter > 3;
+  return counter > 10;
 }
 
-bool isAltitudeRising() {
-  return (x.pData[1] > 10 && usedAlt > 900);
-}
 bool checkAltitudeCondition(double h, double altitude_bme, double altitude_ms, double threshold) {
   int validCount = 0;
   if (h > threshold) validCount++;
   if (altitude_bme > threshold) validCount++;
   if (altitude_ms > threshold) validCount++;
+  Serial.print("Altitude Voting: ");
+  Serial.println(validCount);
   return (validCount >= 2);
 }
 
@@ -391,7 +425,10 @@ void updatePeakPrediction(float currentAltitude, float currentVelocity, float cu
     // Sadece yeterli ivme ve yukarı hareket olduğunda tahmin yap
     if (abs(currentAccelZ) >= minValidAccel && currentVelocity > 0.5f) {
         float netAccel = currentAccelZ - g;  // Gerçek ivme
-        float timeToPeak = currentVelocity / netAccel;
+        float timeToPeak;
+        if (fabs(netAccel) > 0.001f){
+          timeToPeak = currentVelocity / netAccel;
+        }
         
         // Kinematik denklemle zirve tahmini: h = h0 + v*t + 0.5*a*t²
         float newPeakEstimate = currentAltitude + 
@@ -474,7 +511,6 @@ void logSensorData(float usedAlt,float alt_bme,float alt_ms){
     Serial.print("usedAlt: "); Serial.println(usedAlt);
     Serial.print("BME alt: "); Serial.println(alt_bme);
     Serial.print("MS alt: "); Serial.println(alt_ms);
-    Serial.print("Estimated Peak Alt: "); Serial.println(estimatedMaxAltitude);
 
     Serial.print("Accel X: "); Serial.print(acx);
     Serial.print(" | Y: "); Serial.print(acy);
