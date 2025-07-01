@@ -13,12 +13,7 @@ MS5611 ms5611;
 Adafruit_BNO055 bno = Adafruit_BNO055(55);
 #define SEALEVELPRESSSURE_HPA (1013.25)
 
-float h, alt1, alt2;
-double myRealAltitude = 0;
 float usedAlt;
-float prevPeakEstimate = 0;
-float peakSmoothingFactor = 0.9;
-unsigned long lastPeakUpdate = 0;
 bool peakDetected = false;
 unsigned long peakDetectedTime = 0;
 float peakAlt = 0;
@@ -44,8 +39,6 @@ float h_history[VOTING_WINDOW] = {0};
 int history_index = 0;
 
 // System state
-unsigned long lastStateChange = 0;
-const unsigned long stateHoldTime = 100;
 unsigned long lastUpdate = 0;
 float df = 0;                             // Time difference
 float acx = 0, acy = 0, acz = 0;          // Acceleration
@@ -170,15 +163,7 @@ float getAltMS() {
   float alt = 44330.0f * (1.0f - pow(pressure_hPa / SEALEVELPRESSSURE_HPA, 0.1903f));
   return safeValue(alt, x_data[0]);
 }
-/*
-float fuseAltitudes(float alt1, float alt2) {
-  // Simple fusion with outlier rejection
-  if (abs(alt1 - alt2) > 10) {
-    return (abs(alt1 - x_data[0]) < abs(alt2 - x_data[0])) ? alt1 : alt2;
-  }
-  return (alt1 + alt2) / 2.0;
-}
-*/
+
 // Outlier
 float fuseAltitudes(float alt1, float alt2) {
   float diff = abs(alt1 - alt2);
@@ -325,9 +310,6 @@ void update_with_measurement(float z_meas) {
 }
 
 void runStateMachine(float h, float alt1, float alt2, float velocity, float accelZ, float orientationX) {
-  
-  unsigned long now = millis();
-
 
   switch (state) {
     case 1:  // Sensor check
@@ -396,7 +378,6 @@ bool isAltitudeRising() {
 
 bool isLaunchDetected() {
   #define VOTING_WINDOW 10
-  float h_history[VOTING_WINDOW] = {0};
   static int counter = 0;
   h_history[history_index] = x.pData[0];
   history_index = (history_index + 1) % VOTING_WINDOW;
@@ -418,39 +399,6 @@ bool checkAltitudeCondition(double h, double altitude_bme, double altitude_ms, d
   return (validCount >= 2);
 }
 
-void updatePeakPrediction(float currentAltitude, float currentVelocity, float currentAccelZ) {
-    const float g = 9.80665f;
-    const float minValidAccel = 2.0f;
-    
-    // Sadece yeterli ivme ve yukarı hareket olduğunda tahmin yap
-    if (abs(currentAccelZ) >= minValidAccel && currentVelocity > 0.5f) {
-        float netAccel = currentAccelZ - g;  // Gerçek ivme
-        float timeToPeak;
-        if (fabs(netAccel) > 0.001f){
-          timeToPeak = currentVelocity / netAccel;
-        }
-        
-        // Kinematik denklemle zirve tahmini: h = h0 + v*t + 0.5*a*t²
-        float newPeakEstimate = currentAltitude + 
-                              (currentVelocity * timeToPeak) + 
-                              (0.5f * netAccel * timeToPeak * timeToPeak);
-
-        // İlk tahmin
-        if (prevPeakEstimate < 1.0f) {
-            prevPeakEstimate = newPeakEstimate;
-            estimatedMaxAltitude = newPeakEstimate;
-        } 
-        // Sonraki tahminlerde yumuşak geçiş
-        else {
-            estimatedMaxAltitude = (1.0f - peakSmoothingFactor) * prevPeakEstimate + 
-                                 peakSmoothingFactor * newPeakEstimate;
-            prevPeakEstimate = estimatedMaxAltitude;
-        }
-        
-        lastPeakUpdate = millis();
-    }
-}
-
 // Gelişmiş zirve tespit fonksiyonu (Unscented KF çıktılarını kullanır)
 bool peakDetect(float currentAltitude, float currentVelocity, float currentAccelZ, float orientationX) {
     static float prevVelocity = 0;
@@ -459,14 +407,11 @@ bool peakDetect(float currentAltitude, float currentVelocity, float currentAccel
     const int descentThreshold = 3;
     const float decelerationThreshold = -2.0f;  // m/s²
     
-    // 1. Zirve tahminini güncelle
-    updatePeakPrediction(currentAltitude, currentVelocity, currentAccelZ);
-    
-    // 2. Hız değişimini izle
+    // 1. Hız değişimini izle
     bool isDescending = (currentVelocity < prevVelocity);
     prevVelocity = currentVelocity;
     
-    // 3. Alçalma sayacını güncelle
+    // 2. Alçalma sayacını güncelle
     if (isDescending) {
         descentCounter = min(descentCounter + 1, descentThreshold + 1);
     } else {
