@@ -1,7 +1,7 @@
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
-#include <Adafruit_MPL3115A2.h>
+#include <MS5611.h>
 #include <Adafruit_BNO055.h>
 #include <arm_math.h>
 #include <TinyGPS++.h>
@@ -9,18 +9,15 @@
 // Sensor objects
 TinyGPSPlus gps;
 Adafruit_BME280 bme;
-Adafruit_MPL3115A2 mpl;
+MS5611 ms5611;
 Adafruit_BNO055 bno = Adafruit_BNO055(55);
 #define SEALEVELPRESSSURE_HPA (1013.25)
 
-float h, alt1, alt2;
 float usedAlt;
-float prevPeakEstimate = 0;
-float peakSmoothingFactor = 0.9;
-unsigned long lastPeakUpdate = 0;
 bool peakDetected = false;
 unsigned long peakDetectedTime = 0;
 float peakAlt = 0;
+float sensor_std_dev;
 
 // Unscented KF Configuration
 const int n = 2;                            // State dimension (altitude, velocity)
@@ -34,7 +31,7 @@ arm_matrix_instance_f32 x;                  // State vector [n x 1]
 arm_matrix_instance_f32 P;                  // Covariance [n x n]
 arm_matrix_instance_f32 Q;                  // Process noise [n x n]
 float R_bme = 1.5;                          // BME measurement noise
-float R_mpl = 1.5;                          // MPL measurement noise
+float R_ms = 1.5;                          // MS measurement noise
 
 // Sensor fusion
 #define VOTING_WINDOW 10
@@ -59,11 +56,25 @@ float estimatedMaxAltitude = 0;
 
 void setup() {
   Serial.begin(115200);
+  while (!Serial);
+  Wire.begin();
+  Wire.setClock(100000);  // 100 kHz instead of 400 kHz
+
+  Serial.println("I2C Scanner");
+
+  for (byte address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("Found I2C device at 0x");
+      Serial.println(address, HEX);
+    }
+    delay(5);
+  }
   
   // Initialize sensors
   bno.begin();
-  bme.begin(0x77);
-  mpl.begin();
+  ms5611.begin(); 
+  bme.begin(0x76);
 
   // Initialize ARM matrices
   arm_mat_init_f32(&x, n, 1, x_data);
@@ -96,8 +107,8 @@ void loop() {
   // Read sensor data
   readIMUData();
   float alt_bme = getAltBME();
-  float alt_mpl = getAltMPL();
-  float usedAlt = fuseAltitudes(alt_bme, alt_mpl);
+  float alt_ms = getAltMS();
+  usedAlt = fuseAltitudes(alt_bme, alt_ms);
 
   // Unscented KF Prediction
   float Xsig[n][sigmaCount];            // Sigma points
@@ -118,10 +129,14 @@ void loop() {
   update_with_measurement(usedAlt);
 
   // State machine
-  runStateMachine(x_data[0], x_data[1], acz, orx);
+  runStateMachine(x_data[0], alt_bme, alt_ms, x_data[1], acz, orx);
 
   // Log data
-  logSensorData(usedAlt, alt_bme, alt_mpl);
+  logSensorData(usedAlt, alt_bme, alt_ms);
+}
+
+float safeValue(float v, float fallback) {
+  return (isnan(v) || isinf(v)) ? fallback : v;
 }
 
 void readIMUData() {
@@ -138,16 +153,23 @@ void readIMUData() {
 }
 
 float getAltBME() {
-  return bme.readAltitude(SEALEVELPRESSSURE_HPA);
+  return safeValue(bme.readAltitude(SEALEVELPRESSSURE_HPA), x_data[0]);
 }
 
-float getAltMPL() {
-  return mpl.getAltitude();
+float getAltMS() {
+  float pressure = ms5611.readPressure();
+  if (isnan(pressure) || pressure <= 0) return x_data[0];
+  float pressure_hPa = pressure / 50.0f;
+  float alt = 44330.0f * (1.0f - pow(pressure_hPa / SEALEVELPRESSSURE_HPA, 0.1903f));
+  return safeValue(alt, x_data[0]);
 }
 
+// Outlier
 float fuseAltitudes(float alt1, float alt2) {
-  // Simple fusion with outlier rejection
-  if (abs(alt1 - alt2) > 10) {
+  float diff = abs(alt1 - alt2);
+  float threshold = sensor_std_dev * 3.0; // 3σ kuralı
+
+  if (diff > threshold) {
     return (abs(alt1 - x_data[0]) < abs(alt2 - x_data[0])) ? alt1 : alt2;
   }
   return (alt1 + alt2) / 2.0;
@@ -162,7 +184,8 @@ void generate_sigma_points(float Xsig[n][sigmaCount]) {
   // Compute Cholesky decomposition (P = L*L^T)
   for (int i = 0; i < n; i++) {
     for (int j = 0; j < n; j++) {
-      sqrtP[i][j] = (i == j) ? sqrt(P_data[i*n + j]) : 0;
+      float val = P_data[i*n + j];
+      sqrtP[i][j] = (i == j && val > 0) ? sqrt(val) : 0;
     }
   }
   
@@ -241,9 +264,13 @@ void update_with_measurement(float z_meas) {
   // Measurement prediction
   float z_pred = x_data[0];
   float innov = z_meas - z_pred;
-  float R_combined = (R_bme + R_mpl) * 0.5f;
+  float R_combined = (R_bme + R_ms) * 0.5f;
 
-  float relInnov = fabs(innov) / max(fabs(z_pred), 1.0f);
+  float relInnov = 0;
+
+  if(!isnan(z_pred) && !isnan(innov)){
+    relInnov = fabs(innov) / max(fabs(z_pred), 1.0f);
+  }
 
   if (relInnov > 0.05f){
     R_combined *= 10.0f;
@@ -276,18 +303,17 @@ void update_with_measurement(float z_meas) {
   arm_mat_mult_f32(&P_temp_mat, &P_mat, &P_mat);
   
   // Add KRK' term
-  P_data[0] += K[0] * R_combined * K[0];
-  P_data[1] += K[0] * R_combined * K[1];
-  P_data[2] += K[1] * R_combined * K[0];
-  P_data[3] += K[1] * R_combined * K[1];
+  P_data[0] += K0 * R_combined * K0;
+  P_data[1] += K0 * R_combined * K1;
+  P_data[2] += K1 * R_combined * K0;
+  P_data[3] += K1 * R_combined * K1;
 }
 
-void runStateMachine(float altitude, float velocity, float accelZ, float orientationX) {
-  static unsigned long peakDetectedTime = 0;
-  static float peakAlt = 0;
-  
+void runStateMachine(float h, float alt1, float alt2, float velocity, float accelZ, float orientationX) {
+
   switch (state) {
     case 1:  // Sensor check
+
       if (testSensors()) {
         state = 2;
         digitalWrite(8, HIGH);
@@ -302,21 +328,21 @@ void runStateMachine(float altitude, float velocity, float accelZ, float orienta
       break;
       
     case 3:  // Ascent
-      if (checkAltitudeCondition(h, alt1, alt2, 4000) && (-10 < orx && orx < 10)) state = 4;
+      if (checkAltitudeCondition(h, alt1, alt2, 4000)) state = 4;
       break;
       
     case 4:  // Apogee detection
-      if (peakDetect(altitude, velocity, accelZ, orientationX)) {
+      if (peakDetect(h, velocity, accelZ, orientationX)) {
         parachute1 = true;
         state = 5;
         digitalWrite(5, HIGH);
-        peakAlt = altitude;
+        peakAlt = h;
         peakDetectedTime = millis();
       }
       break;
       
     case 5:  // Descent
-      if (altitude < 600 && parachute1) {
+      if (h < 1000 && parachute1) {
         parachute2 = true;
         state = 6;
         digitalWrite(4, HIGH);
@@ -324,7 +350,7 @@ void runStateMachine(float altitude, float velocity, float accelZ, float orienta
       break;
       
     case 6:  // Landing
-      if (altitude < 50 && velocity < 5) {
+      if (h < 50 && velocity < 5) {
         Serial.println("Landing complete");
       }
       break;
@@ -333,70 +359,44 @@ void runStateMachine(float altitude, float velocity, float accelZ, float orienta
 
 bool testSensors() {
   float alt_bme = getAltBME();
-  float alt_mpl = getAltMPL();
+  float alt_ms = getAltMS();
   imu::Vector<3> accel = bno.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
 
   bool bme_ok = !isnan(alt_bme) && alt_bme > -100 && alt_bme < 10000;
-  bool mpl_ok = !isnan(alt_mpl) && alt_mpl > -100 && alt_mpl < 10000;
+  bool ms_ok = !isnan(alt_ms) && alt_ms > -100 && alt_ms < 10000;
   bool bno_ok = !isnan(accel.x()) && !isnan(accel.y()) && !isnan(accel.z());
 
-  return bme_ok && mpl_ok && bno_ok;
+  return bme_ok && ms_ok && bno_ok;
+}
+
+bool isAltitudeRising() {
+  if(x.pData[1] > 5 && usedAlt > 900){
+    return true;
+  }
+  return false;
 }
 
 bool isLaunchDetected() {
   #define VOTING_WINDOW 10
-  float h_history[VOTING_WINDOW] = {0};
   static int counter = 0;
-
   h_history[history_index] = x.pData[0];
   history_index = (history_index + 1) % VOTING_WINDOW;
-  if ((abs(acx) > 3.0 || x.pData[0] - h_history[(history_index + 1) % VOTING_WINDOW] > 2.0) && isAltitudeRising()) {
+  if ((abs(acx) > -1.0 || x.pData[0] - h_history[(history_index + 1) % VOTING_WINDOW] > 2.0) && isAltitudeRising()) {
     counter++;
   } else {
     counter = 0;
   }
-  return counter > 3;
+  return counter > 10;
 }
 
-bool isAltitudeRising() {
-  return (x.pData[1] > 10 && usedAlt > 900);
-}
-bool checkAltitudeCondition(double h, double altitude_bme, double altitude_mpl, double threshold) {
+bool checkAltitudeCondition(double h, double altitude_bme, double altitude_ms, double threshold) {
   int validCount = 0;
   if (h > threshold) validCount++;
   if (altitude_bme > threshold) validCount++;
-  if (altitude_mpl > threshold) validCount++;
+  if (altitude_ms > threshold) validCount++;
+  Serial.print("Altitude Voting: ");
+  Serial.println(validCount);
   return (validCount >= 2);
-}
-
-void updatePeakPrediction(float currentAltitude, float currentVelocity, float currentAccelZ) {
-    const float g = 9.80665f;
-    const float minValidAccel = 2.0f;
-    
-    // Sadece yeterli ivme ve yukarı hareket olduğunda tahmin yap
-    if (abs(currentAccelZ) >= minValidAccel && currentVelocity > 0.5f) {
-        float netAccel = currentAccelZ - g;  // Gerçek ivme
-        float timeToPeak = currentVelocity / netAccel;
-        
-        // Kinematik denklemle zirve tahmini: h = h0 + v*t + 0.5*a*t²
-        float newPeakEstimate = currentAltitude + 
-                              (currentVelocity * timeToPeak) + 
-                              (0.5f * netAccel * timeToPeak * timeToPeak);
-
-        // İlk tahmin
-        if (prevPeakEstimate < 1.0f) {
-            prevPeakEstimate = newPeakEstimate;
-            estimatedMaxAltitude = newPeakEstimate;
-        } 
-        // Sonraki tahminlerde yumuşak geçiş
-        else {
-            estimatedMaxAltitude = (1.0f - peakSmoothingFactor) * prevPeakEstimate + 
-                                 peakSmoothingFactor * newPeakEstimate;
-            prevPeakEstimate = estimatedMaxAltitude;
-        }
-        
-        lastPeakUpdate = millis();
-    }
 }
 
 // Gelişmiş zirve tespit fonksiyonu (Unscented KF çıktılarını kullanır)
@@ -407,14 +407,11 @@ bool peakDetect(float currentAltitude, float currentVelocity, float currentAccel
     const int descentThreshold = 3;
     const float decelerationThreshold = -2.0f;  // m/s²
     
-    // 1. Zirve tahminini güncelle
-    updatePeakPrediction(currentAltitude, currentVelocity, currentAccelZ);
-    
-    // 2. Hız değişimini izle
+    // 1. Hız değişimini izle
     bool isDescending = (currentVelocity < prevVelocity);
     prevVelocity = currentVelocity;
     
-    // 3. Alçalma sayacını güncelle
+    // 2. Alçalma sayacını güncelle
     if (isDescending) {
         descentCounter = min(descentCounter + 1, descentThreshold + 1);
     } else {
@@ -454,12 +451,11 @@ bool peakDetect(float currentAltitude, float currentVelocity, float currentAccel
     return false;
 }
 
-void logSensorData(float usedAlt,float alt_bme,float alt_mpl){
+void logSensorData(float usedAlt,float alt_bme,float alt_ms){
     Serial.print("State: "); Serial.println(state);
     Serial.print("usedAlt: "); Serial.println(usedAlt);
     Serial.print("BME alt: "); Serial.println(alt_bme);
-    Serial.print("MPL alt: "); Serial.println(alt_mpl);
-    Serial.print("Estimated Peak Alt: "); Serial.println(estimatedMaxAltitude);
+    Serial.print("MS alt: "); Serial.println(alt_ms);
 
     Serial.print("Accel X: "); Serial.print(acx);
     Serial.print(" | Y: "); Serial.print(acy);
